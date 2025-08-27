@@ -1,0 +1,13 @@
+C:\Users\User\Desktop\Test\client\WsTunnelClient\bin\Release\WsTunnelClient.exe.config
+C:\Users\User\Desktop\Test\client\WsTunnelClient\bin\Release\WsTunnelClient.exe
+C:\Users\User\Desktop\Test\client\WsTunnelClient\bin\Release\WsTunnelClient.pdb
+C:\Users\User\Desktop\Test\client\WsTunnelClient\bin\Release\Newtonsoft.Json.dll
+C:\Users\User\Desktop\Test\client\WsTunnelClient\bin\Release\Newtonsoft.Json.Bson.dll
+C:\Users\User\Desktop\Test\client\WsTunnelClient\bin\Release\Newtonsoft.Json.Bson.pdb
+C:\Users\User\Desktop\Test\client\WsTunnelClient\bin\Release\protobuf-net.dll
+C:\Users\User\Desktop\Test\client\WsTunnelClient\obj\Release\WsTunnelClient.csproj.AssemblyReference.cache
+C:\Users\User\Desktop\Test\client\WsTunnelClient\obj\Release\WsTunnelClient.csproj.CoreCompileInputs.cache
+C:\Users\User\Desktop\Test\client\WsTunnelClient\obj\Release\WsTunnel.DC1A8DE6.Up2Date
+C:\Users\User\Desktop\Test\client\WsTunnelClient\obj\Release\WsTunnelClient.exe
+C:\Users\User\Desktop\Test\client\WsTunnelClient\obj\Release\WsTunnelClient.pdb
+C:\Users\User\Desktop\Test\client\WsTunnelClient\obj\Release\WsTunnelClient.exe.config
